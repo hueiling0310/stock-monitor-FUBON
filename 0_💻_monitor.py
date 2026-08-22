@@ -25,11 +25,13 @@ import requests
 from html import escape
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 st.set_page_config(page_title="台股監控面板", layout="wide")
 
@@ -774,8 +776,8 @@ def github_repo_config():
     """monitor 這個 repo 自己的設定 (henglunlin-stock-monitor-FUBAN)。"""
     return {
         "token": get_secret_or_default("GITHUB_TOKEN", ""),
-        "owner": get_secret_or_default("GITHUB_OWNER", "henglunlin"),
-        "repo": get_secret_or_default("GITHUB_REPO", "henglunlin-stock-monitor-FUBAN"),
+        "owner": get_secret_or_default("GITHUB_OWNER", "hueiling0310"),
+        "repo": get_secret_or_default("GITHUB_REPO", "stock-monitor-FUBON"),
         "branch": get_secret_or_default("GITHUB_BRANCH", "main"),
     }
 
@@ -790,8 +792,8 @@ def scanner_repo_config():
     """
     return {
         "token": get_secret_or_default("SCANNER_GITHUB_TOKEN", "") or get_secret_or_default("GITHUB_TOKEN", ""),
-        "owner": get_secret_or_default("SCANNER_GITHUB_OWNER", "henglunlin"),
-        "repo": get_secret_or_default("SCANNER_GITHUB_REPO", "stock-scanner-FUBAN"),
+        "owner": get_secret_or_default("SCANNER_GITHUB_OWNER", "hueiling0310"),
+        "repo": get_secret_or_default("SCANNER_GITHUB_REPO", "stock-monitor-FUBON"),
         "branch": get_secret_or_default("SCANNER_GITHUB_BRANCH", "main"),
     }
 
@@ -2570,11 +2572,452 @@ if st.session_state.group_editor_unlocked:
 else:
     st.sidebar.info("目前為唯讀模式：輸入 PIN 後才能修改股票分組")
 
-tw_now = datetime.now(TW_TZ)
-st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
+# =============================================================================
+# 即時監控區塊 (st.fragment)
+# =============================================================================
+# 2026-08-21 效能優化：這一整塊(報價/指標/訊號迴圈、Excel匯出、儀表板、監控表格、
+# WebSocket/資料來源狀態、WebSocket Debug)原本是主程式最下面直接攤平的程式碼，
+# 靠檔案最後一段「time.sleep(refresh_sec) + st.rerun()」讓整支 app.py 每隔
+# refresh_sec 秒重新從頭跑一次——包含上面完全不需要跟著重刷的側邊欄設定、富邦登入、
+# 訊號偵錯面板、分組編輯器等 UI，也會被迫一起重新執行、重新渲染。
+# 改用 st.fragment(run_every=...) 之後，只有這個函式內的內容會依照 run_every
+# 指定的秒數定時自動重跑，函式外面（標題、控制列按鈕、資料來源設定、富邦登入、
+# 訊號偵錯、分組編輯鎖/編輯器）維持原樣不動，畫面上會從「整頁重刷」變成「只有
+# 監控表格本身在跳動」。run_every 是否啟用、間隔幾秒，沿用原本「啟用自動更新」
+# 開關與「刷新秒數」輸入框的邏輯：分組編輯解鎖中或編輯模式中一律暫停自動刷新，
+# 跟原本 time.sleep 那段的暫停條件完全一致。
+# =============================================================================
+# 平行抓取股票資料 (Phase 1)
+# =============================================================================
+# 原本 render_live_monitor() 裡對每檔股票是「依序」做完整套流程：
+# download_stock_data → get_last_price → get_stock_name → get_official_today_ohlc
+# → (缺值時) get_db_ohlc_for_date → compute_indicators，光是網路/DB延遲累加起來，
+# 股票一多就會拖慢整頁刷新速度。
+#
+# 這裡把「抓資料 + 算指標」這種純讀取、無副作用的步驟抽出來，用 ThreadPoolExecutor
+# 平行處理；至於 update_intraday_low/high (會寫 st.session_state)、run_stock_signals
+# (依賴前者算出的 session_open/high/low)、Telegram 推播、notified_stocks 這些
+# 「有狀態」或「跟輸出順序有關」的邏輯，全部維持在主執行緒、依照股票原本的順序
+# 依序執行，跟平行化之前完全一樣——只有「等網路/DB回應」這段被平行化，
+# 其餘行為(包含錯誤處理、訊號判斷、推播順序)不變。
+#
+# 富邦 REST / yfinance 都有各自的流量限制，平行度不宜開太高，避免瞬間送出
+# 大量請求觸發 429；預設 8，可依實際觀察到的限流狀況調整。
+FETCH_MAX_WORKERS = 8
 
-render_taiex_chart()
 
+def _fetch_symbol_for_monitor(symbol, manager, price_ref_date, script_ctx):
+    """
+    平行抓取階段的 worker：只做讀取性質的 I/O + 純運算 (compute_indicators)，
+    不寫 st.session_state、不呼叫 run_stock_signals、不發送 Telegram。
+
+    在背景執行緒裡執行，所以進入函式後第一件事要先把主執行緒的
+    ScriptRunContext 掛到目前這個執行緒上，這是 Streamlit 官方文件建議的
+    多執行緒寫法 (參考: docs.streamlit.io/knowledge-base/using-streamlit/multithreading)，
+    這樣函式內部呼叫的 st.session_state.get(...) 讀取、以及 @st.cache_data
+    裝飾的函式(download_stock_data / get_last_price / get_stock_name /
+    get_official_today_ohlc / get_db_ohlc_for_date 內部用到的那些)才能正常運作。
+    """
+    if script_ctx is not None:
+        add_script_run_ctx(threading.current_thread(), script_ctx)
+
+    raw_df = download_stock_data(symbol)
+    df = normalize_ohlc(raw_df)
+    if df.empty:
+        raise ValueError("無法解析 yfinance 欄位格式")
+    price, price_source = get_last_price(symbol, df, manager)
+    stock_name = get_stock_name(symbol)
+    # 優先使用富邦官方 REST 今日開高低價；第二順位改查本地資料庫 price_ref_date
+    # 那一天的真實開高低 (邏輯跟平行化之前完全一樣，只是搬進 worker 函式裡)。
+    official_ohlc = get_official_today_ohlc(manager, symbol)
+    if official_ohlc.get("open") is None or official_ohlc.get("high") is None or official_ohlc.get("low") is None:
+        db_ohlc = get_db_ohlc_for_date(symbol, price_ref_date.strftime("%Y-%m-%d"))
+        for _k in ("open", "high", "low"):
+            if official_ohlc.get(_k) is None and db_ohlc.get(_k) is not None:
+                official_ohlc[_k] = db_ohlc[_k]
+
+    data = compute_indicators(df, price, price_ref_date=price_ref_date)
+
+    return {
+        "df": df,
+        "price": price,
+        "price_source": price_source,
+        "stock_name": stock_name,
+        "official_ohlc": official_ohlc,
+        "data": data,
+    }
+
+
+def _fetch_all_symbols_parallel(all_symbols_ordered, manager, price_ref_date):
+    """
+    對 all_symbols_ordered (已去重、保留原始出現順序) 平行呼叫 _fetch_symbol_for_monitor()。
+    回傳 dict: {symbol: (result_dict_or_None, exception_or_None)}，
+    呼叫端(主執行緒)依序讀取這個 dict 即可，不需要再關心平行處理的細節。
+    """
+    fetch_results = {}
+    if not all_symbols_ordered:
+        return fetch_results
+
+    script_ctx = get_script_run_ctx()
+    max_workers = min(FETCH_MAX_WORKERS, len(all_symbols_ordered))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {
+            executor.submit(_fetch_symbol_for_monitor, sym, manager, price_ref_date, script_ctx): sym
+            for sym in all_symbols_ordered
+        }
+        for future in future_to_symbol:
+            sym = future_to_symbol[future]
+            try:
+                fetch_results[sym] = (future.result(), None)
+            except Exception as e:
+                fetch_results[sym] = (None, e)
+    return fetch_results
+
+
+_live_monitor_run_every = (
+    f"{max(1, int(st.session_state.get('refresh_sec', REFRESH_SEC)))}s"
+    if st.session_state.auto_refresh_enabled
+    and not st.session_state.group_editor_unlocked
+    and not st.session_state.editing_mode
+    else None
+)
+
+
+@st.fragment(run_every=_live_monitor_run_every)
+def render_live_monitor(rise_threshold):
+    # 2026-08-21 修正：Streamlit 較新版本的 check_fragment_path_policy 規則不允許
+    # 在 @st.fragment 函式「內部」建立寫入到 st.sidebar 的新元件(widget)——
+    # 原因是 run_every 定時觸發的 fragment-only rerun 只能局部更新 fragment
+    # 自己所在的那塊畫面，沒辦法同時更新側邊欄這種在 fragment 範圍「外面」的區域，
+    # 所以像 st.sidebar.number_input() 這種會在側邊欄建立新widget的呼叫，
+    # 一旦被 fragment-only rerun 觸發就會丟出
+    # StreamlitFragmentWidgetsNotAllowedOutsideError。
+    # 修法：把這個 widget 搬到 fragment 外面(在呼叫 render_live_monitor() 之前)，
+    # 用參數傳進來即可；widget 本身仍然只在「完整重跑」時才需要重新建立，
+    # 使用者調整門檻數值時本來就會觸發完整重跑，行為不受影響。
+    tw_now = datetime.now(TW_TZ)
+    st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    render_taiex_chart()
+
+    manager = st.session_state.fubon_manager
+    if st.session_state.fubon_logged_in:
+        login_time = st.session_state.get("fubon_login_time")
+        can_subscribe = True
+        if login_time:
+            can_subscribe = (datetime.now(TW_TZ) - login_time).total_seconds() >= 1
+        if can_subscribe:
+            all_symbols = []
+            for stocks in st.session_state.stock_groups.values():
+                all_symbols.extend(stocks)
+            manager.subscribe_many(all_symbols)
+        else:
+            st.sidebar.info("等待富邦 WebSocket 連線穩定後訂閱股票...")
+
+    with st.sidebar.expander("📡 富邦 WebSocket 狀態", expanded=True):
+        status = manager.get_status()
+        if status["connected"]:
+            st.markdown('<span class="ws-ok">● Connected</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="ws-bad">● Not connected</span>', unsafe_allow_html=True)
+        st.caption(f"已訂閱：{status['subscribed_count']} 檔")
+        if status["last_message_at"]:
+            st.caption(f"最後資料：{status['last_message_at'].strftime('%H:%M:%S')}")
+        if status["error"]:
+            st.warning(status["error"])
+
+    with st.sidebar.expander("🕒 目前資料來源狀態", expanded=True):
+        if st.session_state.get("post_market_enabled", False):
+            _pm_src = st.session_state.get("post_market_source", "db")
+            st.info(f"盤後資料模式：當日＋歷史資料皆來自 {'twse_ohlcv.db' if _pm_src == 'db' else 'yfinance'}")
+        else:
+            _rt_src = st.session_state.get("realtime_source", "fubon")
+            _hist_src = st.session_state.get("history_source", "db")
+            if _rt_src == "fubon":
+                if is_fubon_realtime_time():
+                    st.info("即時資料：09:00~13:30 優先富邦 WebSocket")
+                else:
+                    st.info("即時資料：13:30 後自動切到 yfinance")
+            else:
+                st.info("即時資料：強制使用 yfinance")
+            st.caption(f"歷史資料來源：{'twse_ohlcv.db' if _hist_src == 'db' else 'yfinance'}")
+
+    can_push_now = False
+    current_schedule_key = None
+    manual_push_triggered = False
+    if st.session_state.tg_push_enabled:
+        manual_push_triggered = check_telegram_push_command()
+        if manual_push_triggered:
+            can_push_now = True
+            st.session_state.notified_stocks = set()
+            st.toast("🚀 收到 'push' 指令，強制觸發推播！")
+            send_telegram_message("🤖 <b>收到指令，開始為您掃描並強制推播強勢股...</b>")
+        elif st.session_state.scheduled_push_enabled:
+            TARGET_TIMES = [
+                tw_now.replace(hour=9, minute=40, second=0, microsecond=0),
+                tw_now.replace(hour=10, minute=0, second=0, microsecond=0),
+                tw_now.replace(hour=11, minute=0, second=0, microsecond=0),
+                tw_now.replace(hour=12, minute=0, second=0, microsecond=0),
+                tw_now.replace(hour=13, minute=0, second=0, microsecond=0),
+            ]
+            for target_dt in TARGET_TIMES:
+                diff_seconds = (tw_now - target_dt).total_seconds()
+                if abs(diff_seconds) <= 45:
+                    time_str = target_dt.strftime("%H%M")
+                    today_str = tw_now.strftime("%Y%m%d")
+                    current_schedule_key = f"slot_{today_str}_{time_str}"
+                    if current_schedule_key not in st.session_state.processed_time_slots:
+                        can_push_now = True
+                        break
+
+    # 「今天應該視為哪個交易日」：平日就是今天；週六/週日一律往前推到最近的週五，
+    # 直接複用 download_stock_data() 內部也在用的 get_history_cutoff_date() 規則，
+    # 讓抓歷史資料/算昨收/跑訊號模組三處對「今天是哪一天」的認知永遠一致。
+    # (原本這行寫在每檔股票的迴圈裡面重算，但其實只跟 tw_now 有關、每檔股票都算出
+    #  同一個值，搬到迴圈外面算一次即可，語意完全不變。)
+    price_ref_date = get_effective_trading_reference_date(tw_now)
+
+    # ===== 平行抓取階段: 把所有分組、去重後的股票代碼一次送進 ThreadPoolExecutor =====
+    # (同一檔股票若同時存在多個分組，只會平行抓一次，下面依序處理時各分組直接共用
+    #  同一份結果 —— 這跟平行化之前「同一次刷新內第二次呼叫會命中 st.cache_data 快取」
+    #  的效果一致，只是現在用同一份記憶體內結果重複利用，更直接。)
+    all_symbols_ordered = []
+    _seen_symbols = set()
+    for _stocks in st.session_state.stock_groups.values():
+        for _symbol in _stocks:
+            if _symbol not in _seen_symbols:
+                _seen_symbols.add(_symbol)
+                all_symbols_ordered.append(_symbol)
+    fetch_results = _fetch_all_symbols_parallel(all_symbols_ordered, manager, price_ref_date)
+
+    group_tables = {}
+    group_up_summary = []
+    for group_name, stocks in st.session_state.stock_groups.items():
+        rows = []
+        hit_count = up_count = down_count = flat_count = error_count = 0
+        valid_stock_stats = []
+        hit_names = []
+        for symbol in stocks:
+            try:
+                fetch_result, fetch_error = fetch_results.get(symbol, (None, None))
+                if fetch_error is not None:
+                    raise fetch_error
+                if fetch_result is None:
+                    raise RuntimeError(f"{symbol} 沒有平行抓取結果 (不應發生)")
+                df = fetch_result["df"]
+                price = fetch_result["price"]
+                price_source = fetch_result["price_source"]
+                stock_name = fetch_result["stock_name"]
+                official_ohlc = fetch_result["official_ohlc"]
+                data = fetch_result["data"]
+                # 優先使用富邦官方 REST 今日開高低價（100% 準確，交易所自己算好的）；
+                # 第二順位改查本地資料庫「price_ref_date 那一天」的真實開高低
+                # (解決 TWSE DB / 非即時來源時，價格是固定值、session追蹤會失真的問題)；
+                # 最後才 fallback 回自己用 WS 逐筆成交追蹤的 session_low / session_high，
+                # 確保任何情況下都不會整頁掛掉。
+                # (以上抓取 + 缺值補值的邏輯已搬進 _fetch_symbol_for_monitor() 平行執行，
+                #  這裡開始才是原本就必須留在主執行緒依序處理的部分。)
+                if official_ohlc.get("low") is not None:
+                    session_low = official_ohlc["low"]
+                else:
+                    session_low = update_intraday_low(symbol, price, tw_now, price_source)
+                if official_ohlc.get("high") is not None:
+                    session_high = official_ohlc["high"]
+                else:
+                    session_high = update_intraday_high(symbol, price, tw_now, price_source)
+                session_open = official_ohlc.get("open") if official_ohlc.get("open") is not None else price
+
+                # data (compute_indicators 的結果) 已經在平行抓取階段算好，直接複用，不再重算。
+                signal_hits, signal_display = run_stock_signals(
+                    symbol, stock_name, df,
+                    open_val=session_open,
+                    high_val=max(session_high, price),
+                    low_val=min(session_low, price),
+                    close_val=price,
+                    rise_threshold=rise_threshold,
+                    price_ref_date=price_ref_date,
+                )
+
+                is_high_gain = data["pct"] >= 5
+                # 過濾規則：如果命中的訊號「只有」廣義上升三法 / 廣義下降三法，不算數（不觸發推播）；
+                # 只要還有其他訊號一起命中，就照樣算數，一併推送。
+                pushable_signal_hits = [h for h in signal_hits if h["label"] not in GENERALIZED_THREE_METHOD_LABELS]
+                has_priority_signal = bool(pushable_signal_hits)
+                if is_high_gain or has_priority_signal:
+                    base_symbol = symbol.split('.')[0]
+                    yahoo_url = f"https://tw.stock.yahoo.com/quote/{base_symbol}"
+                    symbol_link = f'<a href="{yahoo_url}">{symbol}</a>'
+                    today_str = tw_now.strftime("%Y-%m-%d")
+                    notify_key = f"{symbol}_{today_str}"
+                    if can_push_now and (notify_key not in st.session_state.notified_stocks):
+                        msg = (
+                            f"🔔 <b>強勢股達標通知：{stock_name} ({symbol_link})</b>\n\n"
+                            f"📈 價格：{data['price']}\n"
+                            f"🔥 漲幅：{data['pct']:+.2f}%\n"
+                            f"📊 買賣訊號：{signal_display}\n"
+                            f"📡 價格來源：{price_source}"
+                        )
+                        send_telegram_message(msg)
+                        st.session_state.notified_stocks.add(notify_key)
+
+                if data["pct"] >= rise_threshold:
+                    hit_count += 1
+                    hit_names.append(stock_name)
+                if data["pct"] > 0:
+                    up_count += 1
+                elif data["pct"] < 0:
+                    down_count += 1
+                else:
+                    flat_count += 1
+                valid_stock_stats.append({"symbol": symbol, "code": symbol_to_code(symbol), "name": stock_name, "pct": float(data["pct"])})
+                rows.append({
+                    "代碼": symbol,
+                    "代碼網址": yahoo_quote_url(symbol),
+                    "股票名稱": stock_name,
+                    "價格": f"{data['price']:.2f}",
+                    "昨收": f"{data['yesterday_close']:.2f}",
+                    "漲跌%": data["pct"],
+                    "MA位置": data["ma_range"],
+                    "MA排列": data["ma_trend"],
+                    "K值": data["k"],
+                    "D值": f"{data['d']:.1f}",
+                    "買賣訊號": signal_display,
+                    "價格來源": price_source,
+                    "_pct_raw": float(data["pct"]),
+                })
+            except Exception as e:
+                error_count += 1
+                rows.append({
+                    "代碼": symbol,
+                    "代碼網址": "",
+                    "股票名稱": get_stock_name(symbol),
+                    "價格": "錯誤",
+                    "昨收": "-",
+                    "漲跌%": "-",
+                    "MA位置": "-",
+                    "MA排列": "-",
+                    "K值": "-",
+                    "D值": "-",
+                    "買賣訊號": str(e),
+                    "價格來源": "-",
+                    "_pct_raw": None,
+                })
+
+        hit_names_text = compact_name_list(hit_names, max_show=4)
+        top3_html = build_top3_html(valid_stock_stats)
+        df_table = pd.DataFrame(rows)
+        display_df = df_table.copy()
+        if not display_df.empty:
+            display_df["漲跌%"] = display_df["漲跌%"].apply(format_color)
+            display_df["K值"] = display_df["K值"].apply(format_k)
+            display_df["買賣訊號"] = display_df["買賣訊號"].apply(format_signal)
+        group_tables[group_name] = {"count": len(stocks), "table": display_df, "raw_rows": rows}
+        group_up_summary.append({
+            "分類": group_name,
+            "達標數": hit_count,
+            "達標股票名稱": hit_names_text,
+            "前三名HTML": top3_html,
+            "上漲數": up_count,
+            "下跌數": down_count,
+            "平盤數": flat_count,
+            "錯誤數": error_count,
+            "總數": len(stocks),
+        })
+
+    if can_push_now and st.session_state.scheduled_push_enabled and current_schedule_key and not manual_push_triggered:
+        st.session_state.processed_time_slots.add(current_schedule_key)
+
+    # ===== Excel 匯出：把這次掃描結果(全部分組)彙整成一份 Excel 供下載 =====
+    excel_dl_col1, excel_dl_col2 = st.columns([1.6, 6.4], vertical_alignment="center")
+    with excel_dl_col1:
+        monitor_excel_bytes = build_monitor_excel_bytes(group_tables)
+        monitor_excel_filename = f"monitor_snapshot_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.download_button(
+            "📥 下載監控總表 Excel",
+            data=monitor_excel_bytes,
+            file_name=monitor_excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_monitor_excel_btn",
+            width="stretch",
+        )
+    with excel_dl_col2:
+        st.caption("Excel 含「全部彙總」分頁 + 各分組各自一個分頁，數值欄位保留原始數字方便排序/篩選。")
+
+    render_summary_dashboard(group_up_summary, rise_threshold)
+    st.divider()
+    for group_name, info in group_tables.items():
+        anchor_id = make_anchor_id(group_name)
+        st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 80px;"></div>', unsafe_allow_html=True)
+        header_col1, header_col2 = st.columns([8, 2])
+        with header_col1:
+            st.subheader(f"【{group_name}】({info['count']}檔)")
+        with header_col2:
+            st.markdown(
+                '<div style="text-align:right; padding-top:0.4rem;">'
+                '<a href="#dashboard-top" class="back-to-dashboard-btn">⬆️ 回到儀表板</a>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        table_df = info["table"].copy()
+        if not table_df.empty and "代碼網址" in table_df.columns:
+            table_df["代碼"] = table_df["代碼網址"]
+        display_columns = [
+            "代碼", "股票名稱", "價格", "昨收", "漲跌%", "MA位置", "MA排列",
+            "K值", "D值", "買賣訊號", "價格來源",
+        ]
+
+        if table_df.empty:
+            st.dataframe(
+                table_df[display_columns],
+                width="stretch",
+                column_config={
+                    "代碼": st.column_config.LinkColumn(
+                        "代碼",
+                        help="點擊前往台股 Yahoo 技術分析頁",
+                        display_text=r"quote/([^/]+)/technical-analysis",
+                    ),
+                    "股票名稱": st.column_config.TextColumn("股票名稱"),
+                },
+            )
+        else:
+            # 「股票名稱」欄位底色標示漲停 / 跌停：
+            # 紅底＝漲停（漲跌% >= 9.5%），綠底＝跌停（漲跌% <= -9.5%），符合台股慣例（紅漲綠跌）。
+            pct_series = table_df["_pct_raw"]
+            display_df_view = table_df[display_columns]
+
+            def _highlight_stock_name(row):
+                pct = pct_series.get(row.name)
+                style = ""
+                if pd.notna(pct):
+                    if pct >= LIMIT_UP_DOWN_PCT_THRESHOLD:
+                        style = "background-color: #ff4d4d; color: #ffffff; font-weight: 700;"
+                    elif pct <= -LIMIT_UP_DOWN_PCT_THRESHOLD:
+                        style = "background-color: #2ecc71; color: #ffffff; font-weight: 700;"
+                return [style if col == "股票名稱" else "" for col in display_df_view.columns]
+
+            styled_df = display_df_view.style.apply(_highlight_stock_name, axis=1)
+
+            st.dataframe(
+                styled_df,
+                width="stretch",
+                column_config={
+                    "代碼": st.column_config.LinkColumn(
+                        "代碼",
+                        help="點擊前往台股 Yahoo 技術分析頁",
+                        display_text=r"quote/([^/]+)/technical-analysis",
+                    ),
+                    "股票名稱": st.column_config.TextColumn("股票名稱"),
+                },
+            )
+        st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
+
+
+# 2026-08-21 修正：原本這個「🔍 WebSocket Debug」side bar 偵錯面板寫在
+# render_live_monitor() 內部，跟上面 rise_threshold 一樣，裡面的 st.text_input()
+# 會在側邊欄建立新widget，被 fragment-only rerun 觸發時一樣會噴
+# StreamlitFragmentWidgetsNotAllowedOutsideError。這個面板純粹是手動除錯用、
+# 不需要跟著 run_every 自動刷新，所以整塊搬到 fragment 外面即可，
+# 视覺順序(畫面最下方)不變。
 rise_threshold = st.sidebar.number_input(
     "漲幅門檻 (%)",
     min_value=0.00,
@@ -2583,311 +3026,14 @@ rise_threshold = st.sidebar.number_input(
     format="%.2f",
 )
 
-manager = st.session_state.fubon_manager
-if st.session_state.fubon_logged_in:
-    login_time = st.session_state.get("fubon_login_time")
-    can_subscribe = True
-    if login_time:
-        can_subscribe = (datetime.now(TW_TZ) - login_time).total_seconds() >= 1
-    if can_subscribe:
-        all_symbols = []
-        for stocks in st.session_state.stock_groups.values():
-            all_symbols.extend(stocks)
-        manager.subscribe_many(all_symbols)
-    else:
-        st.sidebar.info("等待富邦 WebSocket 連線穩定後訂閱股票...")
-
-with st.sidebar.expander("📡 富邦 WebSocket 狀態", expanded=True):
-    status = manager.get_status()
-    if status["connected"]:
-        st.markdown('<span class="ws-ok">● Connected</span>', unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="ws-bad">● Not connected</span>', unsafe_allow_html=True)
-    st.caption(f"已訂閱：{status['subscribed_count']} 檔")
-    if status["last_message_at"]:
-        st.caption(f"最後資料：{status['last_message_at'].strftime('%H:%M:%S')}")
-    if status["error"]:
-        st.warning(status["error"])
-
-with st.sidebar.expander("🕒 目前資料來源狀態", expanded=True):
-    if st.session_state.get("post_market_enabled", False):
-        _pm_src = st.session_state.get("post_market_source", "db")
-        st.info(f"盤後資料模式：當日＋歷史資料皆來自 {'twse_ohlcv.db' if _pm_src == 'db' else 'yfinance'}")
-    else:
-        _rt_src = st.session_state.get("realtime_source", "fubon")
-        _hist_src = st.session_state.get("history_source", "db")
-        if _rt_src == "fubon":
-            if is_fubon_realtime_time():
-                st.info("即時資料：09:00~13:30 優先富邦 WebSocket")
-            else:
-                st.info("即時資料：13:30 後自動切到 yfinance")
-        else:
-            st.info("即時資料：強制使用 yfinance")
-        st.caption(f"歷史資料來源：{'twse_ohlcv.db' if _hist_src == 'db' else 'yfinance'}")
-
-can_push_now = False
-current_schedule_key = None
-manual_push_triggered = False
-if st.session_state.tg_push_enabled:
-    manual_push_triggered = check_telegram_push_command()
-    if manual_push_triggered:
-        can_push_now = True
-        st.session_state.notified_stocks = set()
-        st.toast("🚀 收到 'push' 指令，強制觸發推播！")
-        send_telegram_message("🤖 <b>收到指令，開始為您掃描並強制推播強勢股...</b>")
-    elif st.session_state.scheduled_push_enabled:
-        TARGET_TIMES = [
-            tw_now.replace(hour=9, minute=40, second=0, microsecond=0),
-            tw_now.replace(hour=10, minute=0, second=0, microsecond=0),
-            tw_now.replace(hour=11, minute=0, second=0, microsecond=0),
-            tw_now.replace(hour=12, minute=0, second=0, microsecond=0),
-            tw_now.replace(hour=13, minute=0, second=0, microsecond=0),
-        ]
-        for target_dt in TARGET_TIMES:
-            diff_seconds = (tw_now - target_dt).total_seconds()
-            if abs(diff_seconds) <= 45:
-                time_str = target_dt.strftime("%H%M")
-                today_str = tw_now.strftime("%Y%m%d")
-                current_schedule_key = f"slot_{today_str}_{time_str}"
-                if current_schedule_key not in st.session_state.processed_time_slots:
-                    can_push_now = True
-                    break
-
-group_tables = {}
-group_up_summary = []
-for group_name, stocks in st.session_state.stock_groups.items():
-    rows = []
-    hit_count = up_count = down_count = flat_count = error_count = 0
-    valid_stock_stats = []
-    hit_names = []
-    for symbol in stocks:
-        try:
-            raw_df = download_stock_data(symbol)
-            df = normalize_ohlc(raw_df)
-            if df.empty:
-                raise ValueError("無法解析 yfinance 欄位格式")
-            price, price_source = get_last_price(symbol, df, manager)
-            stock_name = get_stock_name(symbol)
-            # 「今天應該視為哪個交易日」：平日就是今天；週六/週日一律往前推到最近的週五，
-            # 直接複用 download_stock_data() 內部也在用的 get_history_cutoff_date() 規則，
-            # 讓抓歷史資料/算昨收/跑訊號模組三處對「今天是哪一天」的認知永遠一致。
-            price_ref_date = get_effective_trading_reference_date(tw_now)
-            # 優先使用富邦官方 REST 今日開高低價（100% 準確，交易所自己算好的）；
-            # 第二順位改查本地資料庫「price_ref_date 那一天」的真實開高低
-            # (解決 TWSE DB / 非即時來源時，價格是固定值、session追蹤會失真的問題)；
-            # 最後才 fallback 回自己用 WS 逐筆成交追蹤的 session_low / session_high，
-            # 確保任何情況下都不會整頁掛掉。
-            official_ohlc = get_official_today_ohlc(manager, symbol)
-            if official_ohlc.get("open") is None or official_ohlc.get("high") is None or official_ohlc.get("low") is None:
-                db_ohlc = get_db_ohlc_for_date(symbol, price_ref_date.strftime("%Y-%m-%d"))
-                for _k in ("open", "high", "low"):
-                    if official_ohlc.get(_k) is None and db_ohlc.get(_k) is not None:
-                        official_ohlc[_k] = db_ohlc[_k]
-            if official_ohlc.get("low") is not None:
-                session_low = official_ohlc["low"]
-            else:
-                session_low = update_intraday_low(symbol, price, tw_now, price_source)
-            if official_ohlc.get("high") is not None:
-                session_high = official_ohlc["high"]
-            else:
-                session_high = update_intraday_high(symbol, price, tw_now, price_source)
-            session_open = official_ohlc.get("open") if official_ohlc.get("open") is not None else price
-
-            data = compute_indicators(df, price, price_ref_date=price_ref_date)
-            signal_hits, signal_display = run_stock_signals(
-                symbol, stock_name, df,
-                open_val=session_open,
-                high_val=max(session_high, price),
-                low_val=min(session_low, price),
-                close_val=price,
-                rise_threshold=rise_threshold,
-                price_ref_date=price_ref_date,
-            )
-
-            is_high_gain = data["pct"] >= 5
-            # 過濾規則：如果命中的訊號「只有」廣義上升三法 / 廣義下降三法，不算數（不觸發推播）；
-            # 只要還有其他訊號一起命中，就照樣算數，一併推送。
-            pushable_signal_hits = [h for h in signal_hits if h["label"] not in GENERALIZED_THREE_METHOD_LABELS]
-            has_priority_signal = bool(pushable_signal_hits)
-            if is_high_gain or has_priority_signal:
-                base_symbol = symbol.split('.')[0]
-                yahoo_url = f"https://tw.stock.yahoo.com/quote/{base_symbol}"
-                symbol_link = f'<a href="{yahoo_url}">{symbol}</a>'
-                today_str = tw_now.strftime("%Y-%m-%d")
-                notify_key = f"{symbol}_{today_str}"
-                if can_push_now and (notify_key not in st.session_state.notified_stocks):
-                    msg = (
-                        f"🔔 <b>強勢股達標通知：{stock_name} ({symbol_link})</b>\n\n"
-                        f"📈 價格：{data['price']}\n"
-                        f"🔥 漲幅：{data['pct']:+.2f}%\n"
-                        f"📊 買賣訊號：{signal_display}\n"
-                        f"📡 價格來源：{price_source}"
-                    )
-                    send_telegram_message(msg)
-                    st.session_state.notified_stocks.add(notify_key)
-
-            if data["pct"] >= rise_threshold:
-                hit_count += 1
-                hit_names.append(stock_name)
-            if data["pct"] > 0:
-                up_count += 1
-            elif data["pct"] < 0:
-                down_count += 1
-            else:
-                flat_count += 1
-            valid_stock_stats.append({"symbol": symbol, "code": symbol_to_code(symbol), "name": stock_name, "pct": float(data["pct"])})
-            rows.append({
-                "代碼": symbol,
-                "代碼網址": yahoo_quote_url(symbol),
-                "股票名稱": stock_name,
-                "價格": f"{data['price']:.2f}",
-                "昨收": f"{data['yesterday_close']:.2f}",
-                "漲跌%": data["pct"],
-                "MA位置": data["ma_range"],
-                "MA排列": data["ma_trend"],
-                "K值": data["k"],
-                "D值": f"{data['d']:.1f}",
-                "買賣訊號": signal_display,
-                "價格來源": price_source,
-                "_pct_raw": float(data["pct"]),
-            })
-        except Exception as e:
-            error_count += 1
-            rows.append({
-                "代碼": symbol,
-                "代碼網址": "",
-                "股票名稱": get_stock_name(symbol),
-                "價格": "錯誤",
-                "昨收": "-",
-                "漲跌%": "-",
-                "MA位置": "-",
-                "MA排列": "-",
-                "K值": "-",
-                "D值": "-",
-                "買賣訊號": str(e),
-                "價格來源": "-",
-                "_pct_raw": None,
-            })
-
-    hit_names_text = compact_name_list(hit_names, max_show=4)
-    top3_html = build_top3_html(valid_stock_stats)
-    df_table = pd.DataFrame(rows)
-    display_df = df_table.copy()
-    if not display_df.empty:
-        display_df["漲跌%"] = display_df["漲跌%"].apply(format_color)
-        display_df["K值"] = display_df["K值"].apply(format_k)
-        display_df["買賣訊號"] = display_df["買賣訊號"].apply(format_signal)
-    group_tables[group_name] = {"count": len(stocks), "table": display_df, "raw_rows": rows}
-    group_up_summary.append({
-        "分類": group_name,
-        "達標數": hit_count,
-        "達標股票名稱": hit_names_text,
-        "前三名HTML": top3_html,
-        "上漲數": up_count,
-        "下跌數": down_count,
-        "平盤數": flat_count,
-        "錯誤數": error_count,
-        "總數": len(stocks),
-    })
-
-if can_push_now and st.session_state.scheduled_push_enabled and current_schedule_key and not manual_push_triggered:
-    st.session_state.processed_time_slots.add(current_schedule_key)
-
-# ===== Excel 匯出：把這次掃描結果(全部分組)彙整成一份 Excel 供下載 =====
-excel_dl_col1, excel_dl_col2 = st.columns([1.6, 6.4], vertical_alignment="center")
-with excel_dl_col1:
-    monitor_excel_bytes = build_monitor_excel_bytes(group_tables)
-    monitor_excel_filename = f"monitor_snapshot_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx"
-    st.download_button(
-        "📥 下載監控總表 Excel",
-        data=monitor_excel_bytes,
-        file_name=monitor_excel_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_monitor_excel_btn",
-        width="stretch",
-    )
-with excel_dl_col2:
-    st.caption("Excel 含「全部彙總」分頁 + 各分組各自一個分頁，數值欄位保留原始數字方便排序/篩選。")
-
-render_summary_dashboard(group_up_summary, rise_threshold)
-st.divider()
-for group_name, info in group_tables.items():
-    anchor_id = make_anchor_id(group_name)
-    st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 80px;"></div>', unsafe_allow_html=True)
-    header_col1, header_col2 = st.columns([8, 2])
-    with header_col1:
-        st.subheader(f"【{group_name}】({info['count']}檔)")
-    with header_col2:
-        st.markdown(
-            '<div style="text-align:right; padding-top:0.4rem;">'
-            '<a href="#dashboard-top" class="back-to-dashboard-btn">⬆️ 回到儀表板</a>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    table_df = info["table"].copy()
-    if not table_df.empty and "代碼網址" in table_df.columns:
-        table_df["代碼"] = table_df["代碼網址"]
-    display_columns = [
-        "代碼", "股票名稱", "價格", "昨收", "漲跌%", "MA位置", "MA排列",
-        "K值", "D值", "買賣訊號", "價格來源",
-    ]
-
-    if table_df.empty:
-        st.dataframe(
-            table_df[display_columns],
-            width="stretch",
-            column_config={
-                "代碼": st.column_config.LinkColumn(
-                    "代碼",
-                    help="點擊前往台股 Yahoo 技術分析頁",
-                    display_text=r"quote/([^/]+)/technical-analysis",
-                ),
-                "股票名稱": st.column_config.TextColumn("股票名稱"),
-            },
-        )
-    else:
-        # 「股票名稱」欄位底色標示漲停 / 跌停：
-        # 紅底＝漲停（漲跌% >= 9.5%），綠底＝跌停（漲跌% <= -9.5%），符合台股慣例（紅漲綠跌）。
-        pct_series = table_df["_pct_raw"]
-        display_df_view = table_df[display_columns]
-
-        def _highlight_stock_name(row):
-            pct = pct_series.get(row.name)
-            style = ""
-            if pd.notna(pct):
-                if pct >= LIMIT_UP_DOWN_PCT_THRESHOLD:
-                    style = "background-color: #ff4d4d; color: #ffffff; font-weight: 700;"
-                elif pct <= -LIMIT_UP_DOWN_PCT_THRESHOLD:
-                    style = "background-color: #2ecc71; color: #ffffff; font-weight: 700;"
-            return [style if col == "股票名稱" else "" for col in display_df_view.columns]
-
-        styled_df = display_df_view.style.apply(_highlight_stock_name, axis=1)
-
-        st.dataframe(
-            styled_df,
-            width="stretch",
-            column_config={
-                "代碼": st.column_config.LinkColumn(
-                    "代碼",
-                    help="點擊前往台股 Yahoo 技術分析頁",
-                    display_text=r"quote/([^/]+)/technical-analysis",
-                ),
-                "股票名稱": st.column_config.TextColumn("股票名稱"),
-            },
-        )
-    st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
-
+render_live_monitor(rise_threshold)
 
 with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
+    _debug_manager = st.session_state.fubon_manager
     debug_code = st.text_input("輸入代碼看最後 WS 原始訊息", value="4919")
-    msg = manager.get_message(debug_code)
+    msg = _debug_manager.get_message(debug_code)
     if msg:
         st.caption(f"時間：{msg['time'].strftime('%Y-%m-%d %H:%M:%S')}")
         st.json(msg["raw"])
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
-
-if st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
-    refresh_sec = max(1, int(st.session_state.get("refresh_sec", REFRESH_SEC)))
-    time.sleep(refresh_sec)
-    st.rerun()
